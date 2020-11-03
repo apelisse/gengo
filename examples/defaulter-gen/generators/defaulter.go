@@ -412,6 +412,7 @@ func newCallTreeForType(existingDefaulters, newDefaulters defaulterFuncMap) *cal
 }
 
 func populateDefaultValue(node *callNode, commentLines []string) *callNode {
+	// TODO: Check eligibility of defaulting
 	defaultMap := extractDefaultTag(commentLines)
 	if len(defaultMap) != 0 {
 		if node == nil {
@@ -771,6 +772,9 @@ func (n *callNode) writeDefaulter(varName string, isVarPointer bool, sw *generat
 		accessor = "&" + accessor
 	}
 	if n.defaultValue != "" {
+		// TODO: Check if $var is nil before defaulting
+		// TODO: Escape the defaultValue
+		// TODO: Cache the unmarshal object if possible
 		sw.Do("if err := json.Unmarshal([]byte(`$.defaultValue$`), $.var$); err != nil {\n", generator.Args{
 			"defaultValue": n.defaultValue,
 			"var":          accessor,
