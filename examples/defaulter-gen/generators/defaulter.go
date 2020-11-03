@@ -41,6 +41,11 @@ type CustomArgs struct {
 // These are the comment tags that carry parameters for defaulter generation.
 const tagName = "k8s:defaulter-gen"
 const inputTagName = "k8s:defaulter-gen-input"
+const defaultTagName = "default"
+
+func extractDefaultTag(comments []string) []string {
+	return types.ExtractCommentTags("+", comments)[defaultTagName]
+}
 
 func extractTag(comments []string) []string {
 	return types.ExtractCommentTags("+", comments)[tagName]
@@ -270,6 +275,11 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 			// usually those with TypeMeta).
 			if t.Kind == types.Struct && len(typesWith) > 0 {
 				for _, field := range t.Members {
+					defaultTags := extractDefaultTag(field.CommentLines)
+					if len(defaultTags) > 0 {
+						return true
+					}
+
 					for _, s := range typesWith {
 						if field.Name == s {
 							return true
@@ -401,6 +411,17 @@ func newCallTreeForType(existingDefaulters, newDefaulters defaulterFuncMap) *cal
 	}
 }
 
+func populateDefaultValue(node *callNode, commentLines []string) *callNode {
+	defaultMap := extractDefaultTag(commentLines)
+	if len(defaultMap) != 0 {
+		if node == nil {
+			node = &callNode{}
+		}
+		node.defaultValue = defaultMap[0]
+	}
+	return node
+}
+
 // build creates a tree of paths to fields (based on how they would be accessed in Go - pointer, elem,
 // slice, or key) and the functions that should be invoked on each field. An in-order traversal of the resulting tree
 // can be used to generate a Go function that invokes each nested function on the appropriate type. The return
@@ -465,6 +486,7 @@ func (c *callTreeForType) build(t *types.Type, root bool) *callNode {
 		if child := c.build(t.Elem, false); child != nil {
 			child.elem = true
 			parent.children = append(parent.children, *child)
+			populateDefaultValue(child, t.CommentLines)
 		}
 	case types.Slice, types.Array:
 		if child := c.build(t.Elem, false); child != nil {
@@ -489,14 +511,22 @@ func (c *callTreeForType) build(t *types.Type, root bool) *callNode {
 					name = field.Type.Name.Name
 				}
 			}
+
 			if child := c.build(field.Type, false); child != nil {
 				child.field = name
 				parent.children = append(parent.children, *child)
+				populateDefaultValue(child, field.CommentLines)
+			} else {
+				if member := populateDefaultValue(nil, field.CommentLines); member != nil {
+					member.field = name
+					parent.children = append(parent.children, *member)
+				}
 			}
 		}
 	case types.Alias:
 		if child := c.build(t.Underlying, false); child != nil {
 			parent.children = append(parent.children, *child)
+			populateDefaultValue(child, t.CommentLines)
 		}
 	}
 	if len(parent.children) == 0 && len(parent.call) == 0 {
@@ -676,6 +706,10 @@ type callNode struct {
 	call []*types.Type
 	// children is the child call nodes that must also be traversed
 	children []callNode
+
+	// defaultValue is the defaultValue of a callNode struct
+	// Only primitive types and pointer types are eligible to have a default value
+	defaultValue string
 }
 
 // CallNodeVisitorFunc is a function for visiting a call tree. ancestors is the list of all parents
@@ -731,6 +765,22 @@ func (n *callNode) writeCalls(varName string, isVarPointer bool, sw *generator.S
 	}
 }
 
+func (n *callNode) writeDefaulter(varName string, isVarPointer bool, sw *generator.SnippetWriter) {
+	accessor := varName
+	if !isVarPointer {
+		accessor = "&" + accessor
+	}
+	if n.defaultValue != "" {
+		sw.Do("if err := json.Unmarshal([]byte(`$.defaultValue$`), $.var$); err != nil {\n", generator.Args{
+			"defaultValue": n.defaultValue,
+			"var":          accessor,
+		})
+		sw.Do("panic(err)\n", nil)
+		sw.Do("}\n", nil)
+	}
+
+}
+
 // WriteMethod performs an in-order traversal of the calltree, generating loops and if blocks as necessary
 // to correctly turn the call tree into a method body that invokes all calls on all child nodes of the call tree.
 // Depth is used to generate local variables at the proper depth.
@@ -754,6 +804,8 @@ func (n *callNode) WriteMethod(varName string, depth int, ancestors []*callNode,
 	if isPointer && len(ancestors) > 0 {
 		sw.Do("if $.var$ != nil {\n", vars)
 	}
+
+	n.writeDefaulter(varName, isPointer, sw)
 
 	switch {
 	case n.index:
