@@ -39,10 +39,50 @@ type CustomArgs struct {
 	ExtraPeerDirs []string // Always consider these as last-ditch possibilities for conversions.
 }
 
+type typeInfo struct {
+	name   string
+	format string
+	zero   interface{}
+}
+
+var schemaTypeFormatMap = map[string]typeInfo{
+	"uint":        {"integer", "int32", 0.},
+	"uint8":       {"integer", "byte", 0.},
+	"uint16":      {"integer", "int32", 0.},
+	"uint32":      {"integer", "int64", 0.},
+	"uint64":      {"integer", "int64", 0.},
+	"int":         {"integer", "int32", 0.},
+	"int8":        {"integer", "byte", 0.},
+	"int16":       {"integer", "int32", 0.},
+	"int32":       {"integer", "int32", 0.},
+	"int64":       {"integer", "int64", 0.},
+	"byte":        {"integer", "byte", 0},
+	"float64":     {"number", "double", 0.},
+	"float32":     {"number", "float", 0.},
+	"bool":        {"boolean", "", false},
+	"time.Time":   {"string", "date-time", ""},
+	"string":      {"string", "", ""},
+	"integer":     {"integer", "", 0.},
+	"number":      {"number", "", 0.},
+	"boolean":     {"boolean", "", false},
+	"[]byte":      {"string", "byte", ""}, // base64 encoded characters
+	"interface{}": {"object", "", interface{}(nil)},
+}
+
 // These are the comment tags that carry parameters for defaulter generation.
 const tagName = "k8s:defaulter-gen"
 const inputTagName = "k8s:defaulter-gen-input"
 const defaultTagName = "default"
+
+// Returns the zero-value for the given type along with true if the type
+// could be found.
+func getZeroValue(typeName string) (interface{}, bool) {
+	mapped, ok := schemaTypeFormatMap[typeName]
+	if !ok {
+		return nil, false
+	}
+	return mapped.zero, true
+}
 
 func extractDefaultTag(comments []string) []string {
 	return types.ExtractCommentTags("+", comments)[defaultTagName]
@@ -423,34 +463,55 @@ func resolveAliasType(t *types.Type) *types.Type {
 	return t
 }
 
-func canEnforceDefault(t *types.Type, omitEmpty bool) error {
+func mustEnforceDefault(t *types.Type, omitEmpty bool) (interface{}, error) {
 	switch t.Kind {
 	case types.Pointer, types.Map, types.Slice, types.Array, types.Interface:
-		return nil
+		return nil, nil
+	case types.Struct:
+		return map[string]interface{}{}, nil
 	case types.Builtin:
-		if omitEmpty {
-			return nil
+		if !omitEmpty {
+			if zero, ok := getZeroValue(t.String()); ok {
+				return zero, nil
+			} else {
+				return nil, fmt.Errorf("please add type %v to getZeroValue function", t)
+			}
+
 		}
-		return fmt.Errorf("omitEmpty must be true to set default for %v", t.Kind)
+		return nil, nil
 	default:
-		return fmt.Errorf("not sure how to enforce default for %v", t.Kind)
+		return nil, fmt.Errorf("not sure how to enforce default for %v", t.Kind)
 	}
 }
+
 func populateDefaultValue(node *callNode, t *types.Type, tags string, commentLines []string) *callNode {
 	t = resolveAliasType(t)
 	defaultMap := extractDefaultTag(commentLines)
 	if len(defaultMap) == 1 {
-		omitEmpty := strings.Contains(reflect.StructTag(tags).Get("json"), "omitempty")
-		if err := canEnforceDefault(t, omitEmpty); err != nil {
-			panic(err)
-		}
-		if node == nil {
-			node = &callNode{}
+		var defaultValue interface{}
+		if err := json.Unmarshal([]byte(defaultMap[0]), &defaultValue); err != nil {
+			panic(fmt.Errorf("Failed to unmarshal default: %v", err))
 		}
 
-		var i interface{}
-		if err := json.Unmarshal([]byte(defaultMap[0]), &i); err != nil {
-			panic(fmt.Errorf("failed to unmarshal default: %v", err))
+		omitEmpty := strings.Contains(reflect.StructTag(tags).Get("json"), "omitempty")
+		if enforced, err := mustEnforceDefault(t, omitEmpty); err != nil {
+			panic(err)
+		} else if enforced != nil {
+			if defaultValue != nil {
+				if reflect.DeepEqual(defaultValue, enforced) {
+					// If the default value annotation matches the default value for the type,
+					// do not generate any defaulting function
+					return node
+				} else {
+					enforcedJSON, _ := json.Marshal(enforced)
+					panic(fmt.Errorf("Invalid default value (%#v) for non-pointer/non-omitempty. If specified, must be: %v", defaultValue, string(enforcedJSON)))
+				}
+			}
+		}
+
+		// callNodes are not automatically generated for primitive types. Generate one if the callNode does not exist
+		if node == nil {
+			node = &callNode{}
 		}
 
 		node.defaultValue = defaultMap[0]
@@ -804,17 +865,17 @@ func (n *callNode) writeCalls(varName string, isVarPointer bool, sw *generator.S
 }
 
 func (n *callNode) writeDefaulter(varName string, isVarPointer bool, sw *generator.SnippetWriter) {
-	accessor := varName
+	varPointer := varName
 	if !isVarPointer {
-		accessor = "&" + accessor
+		varPointer = "&" + varPointer
 	}
 	if n.defaultValue != "" {
-		sw.Do("if reflect.ValueOf($.var$).IsNil() {\n", generator.Args{
+		sw.Do("if reflect.ValueOf($.var$).IsZero() {\n", generator.Args{
 			"var": varName,
 		})
-		sw.Do("if err := json.Unmarshal([]byte(`$.defaultValue$`), $.var$); err != nil {\n", generator.Args{
+		sw.Do("if err := json.Unmarshal([]byte(`$.defaultValue$`), $.varPointer$); err != nil {\n", generator.Args{
 			"defaultValue": n.defaultValue,
-			"var":          accessor,
+			"varPointer":   varPointer,
 		})
 		sw.Do("panic(err)\n", nil)
 		sw.Do("}\n", nil)
