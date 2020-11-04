@@ -18,6 +18,7 @@ package generators
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -411,14 +412,50 @@ func newCallTreeForType(existingDefaulters, newDefaulters defaulterFuncMap) *cal
 	}
 }
 
-func populateDefaultValue(node *callNode, commentLines []string) *callNode {
-	// TODO: Check eligibility of defaulting
+func resolveAliasType(t *types.Type) *types.Type {
+	var prev *types.Type
+	for prev != t {
+		prev = t
+		if t.Kind == types.Alias {
+			t = t.Underlying
+		}
+	}
+	return t
+}
+
+func canEnforceDefault(t *types.Type, omitEmpty bool) error {
+	switch t.Kind {
+	case types.Pointer, types.Map, types.Slice, types.Array, types.Interface:
+		return nil
+	case types.Builtin:
+		if omitEmpty {
+			return nil
+		}
+		return fmt.Errorf("omitEmpty must be true to set default for %v", t.Kind)
+	default:
+		return fmt.Errorf("not sure how to enforce default for %v", t.Kind)
+	}
+}
+func populateDefaultValue(node *callNode, t *types.Type, tags string, commentLines []string) *callNode {
+	t = resolveAliasType(t)
 	defaultMap := extractDefaultTag(commentLines)
-	if len(defaultMap) != 0 {
+	if len(defaultMap) == 1 {
+		omitEmpty := strings.Contains(reflect.StructTag(tags).Get("json"), "omitempty")
+		if err := canEnforceDefault(t, omitEmpty); err != nil {
+			panic(err)
+		}
 		if node == nil {
 			node = &callNode{}
 		}
+
+		var i interface{}
+		if err := json.Unmarshal([]byte(defaultMap[0]), &i); err != nil {
+			panic(fmt.Errorf("failed to unmarshal default: %v", err))
+		}
+
 		node.defaultValue = defaultMap[0]
+	} else if len(defaultMap) > 1 {
+		panic(fmt.Errorf("Found more than one default tag for %v", t.Kind))
 	}
 	return node
 }
@@ -487,7 +524,6 @@ func (c *callTreeForType) build(t *types.Type, root bool) *callNode {
 		if child := c.build(t.Elem, false); child != nil {
 			child.elem = true
 			parent.children = append(parent.children, *child)
-			populateDefaultValue(child, t.CommentLines)
 		}
 	case types.Slice, types.Array:
 		if child := c.build(t.Elem, false); child != nil {
@@ -516,18 +552,19 @@ func (c *callTreeForType) build(t *types.Type, root bool) *callNode {
 			if child := c.build(field.Type, false); child != nil {
 				child.field = name
 				parent.children = append(parent.children, *child)
-				populateDefaultValue(child, field.CommentLines)
+				populateDefaultValue(child, field.Type, field.Tags, field.CommentLines)
 			} else {
-				if member := populateDefaultValue(nil, field.CommentLines); member != nil {
+				if member := populateDefaultValue(nil, field.Type, field.Tags, field.CommentLines); member != nil {
 					member.field = name
 					parent.children = append(parent.children, *member)
 				}
+
 			}
+
 		}
 	case types.Alias:
 		if child := c.build(t.Underlying, false); child != nil {
 			parent.children = append(parent.children, *child)
-			populateDefaultValue(child, t.CommentLines)
 		}
 	}
 	if len(parent.children) == 0 && len(parent.call) == 0 {
@@ -772,14 +809,15 @@ func (n *callNode) writeDefaulter(varName string, isVarPointer bool, sw *generat
 		accessor = "&" + accessor
 	}
 	if n.defaultValue != "" {
-		// TODO: Check if $var is nil before defaulting
-		// TODO: Escape the defaultValue
-		// TODO: Cache the unmarshal object if possible
+		sw.Do("if reflect.ValueOf($.var$).IsNil() {\n", generator.Args{
+			"var": varName,
+		})
 		sw.Do("if err := json.Unmarshal([]byte(`$.defaultValue$`), $.var$); err != nil {\n", generator.Args{
 			"defaultValue": n.defaultValue,
 			"var":          accessor,
 		})
 		sw.Do("panic(err)\n", nil)
+		sw.Do("}\n", nil)
 		sw.Do("}\n", nil)
 	}
 
